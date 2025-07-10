@@ -140,29 +140,30 @@ if mode == "🎬 Single Video" and url:
 
             # Audio-only download button
             if st.button("🎵 Download Audio Only"):
+                safe_title = sanitize_filename(info.get('title', 'video'))
+                video_id = info.get('id', 'unknown')
+                filename = f"{safe_title} [{video_id}].mp3"
                 ydl_opts = {
                     'extract_audio': True,
                     'audio_format': 'mp3',
                     'format': 'bestaudio',
-                    'outtmpl': "%(title).200s [%(id)s].%(ext)s",
+                    'outtmpl': filename,
                     'quiet': True,
                     'progress_hooks': hook_factory(st.container())
                 }
                 with YoutubeDL(ydl_opts) as ydl:
                     try:
-                        info = ydl.extract_info(url, download=True)
-                        filepath = info.get('filepath')
-                        if filepath:
-                            with open(filepath, "rb") as f:
+                        ydl.download([url])
+                        if os.path.exists(filename):
+                            with open(filename, "rb") as f:
                                 data = f.read()
-                            os.remove(filepath)  # Clean up
+                            os.remove(filename)  # Clean up
                             st.success("Audio download finished ✅")
-                            file_name = os.path.basename(filepath)
-                            st.download_button("📥 Download Audio", data, file_name=file_name, mime="audio/mpeg")
+                            st.download_button("📥 Download Audio", data, file_name=filename, mime="audio/mpeg")
                         else:
-                            st.error("Failed to download audio")
+                            st.error("Failed to find downloaded audio file")
                     except Exception as e:
-                        st.error(f"Error: {e}")
+                        st.error(f"Error downloading audio: {e}")
 
 # --- Playlist Mode ---
 if mode == "📃 Playlist" and url:
@@ -213,8 +214,10 @@ if mode == "📡 Channel" and url:
 
     if 'channel_videos' not in st.session_state:
         st.session_state.channel_videos = None
-    if 'current_batch' not in st.session_state:
-        st.session_state.current_batch = 0
+    if 'batch_zips' not in st.session_state:
+        st.session_state.batch_zips = []
+    if 'batch_zip_dir' not in st.session_state:
+        st.session_state.batch_zip_dir = tempfile.mkdtemp()
 
     if st.button("Fetch Channel Videos"):
         with st.spinner("Fetching channel info..."):
@@ -223,7 +226,7 @@ if mode == "📡 Channel" and url:
                     channel_info = ydl.extract_info(url, download=False)
                     entries = channel_info.get('entries', [])
                     st.session_state.channel_videos = entries
-                    st.session_state.current_batch = 0
+                    st.session_state.batch_zips = []
                     if entries:
                         st.success(f"Fetched {len(entries)} videos from the channel.")
                     else:
@@ -234,38 +237,50 @@ if mode == "📡 Channel" and url:
     if st.session_state.channel_videos and len(st.session_state.channel_videos) > 0:
         total_videos = len(st.session_state.channel_videos)
         st.write(f"Total videos: {total_videos}")
-        if st.session_state.current_batch * batch_size < total_videos:
-            if st.button("Download Next Batch"):
-                start = st.session_state.current_batch * batch_size
-                end = min(start + batch_size, total_videos)
-                batch_videos = st.session_state.channel_videos[start:end]
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    downloaded_files = []
-                    for idx, video in enumerate(batch_videos, 1):
-                        st.markdown(f"---\n### ⏬ Downloading {start + idx}/{total_videos}: **{video.get('title')}**")
-                        video_url = f"https://www.youtube.com/watch?v={video['id']}"
-                        progress_area = st.container()
-                        success, err = download_video(video_url, temp_dir, progress_area)
-                        if success:
-                            downloaded_files.append(video['title'])
-                        else:
-                            st.error(f"❌ Failed to download: {video['title']} | Error: {err}")
 
-                    # Create zip file
-                    batch_number = st.session_state.current_batch + 1
-                    zip_filename = f"channel_batch_{batch_number}.zip"
-                    zip_path = os.path.join(temp_dir, zip_filename)
-                    with zipfile.ZipFile(zip_path, 'w') as zipf:
-                        for file in os.listdir(temp_dir):
-                            if file.endswith(".mp4"):
-                                zipf.write(os.path.join(temp_dir, file), arcname=file)
+        if st.button("Download All Batches"):
+            with st.spinner("Downloading all batches..."):
+                num_batches = (total_videos + batch_size - 1) // batch_size
+                for batch_idx in range(num_batches):
+                    start = batch_idx * batch_size
+                    end = min(start + batch_size, total_videos)
+                    batch_videos = st.session_state.channel_videos[start:end]
+                    st.markdown(f"### ⏬ Processing Batch {batch_idx + 1}/{num_batches}")
 
-                    # Provide download button
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        downloaded_files = []
+                        for idx, video in enumerate(batch_videos, 1):
+                            st.markdown(f"---\n#### Downloading {start + idx}/{total_videos}: **{video.get('title')}**")
+                            video_url = f"https://www.youtube.com/watch?v={video['id']}"
+                            progress_area = st.container()
+                            success, err = download_video(video_url, temp_dir, progress_area)
+                            if success:
+                                downloaded_files.append(video['title'])
+                            else:
+                                st.error(f"❌ Failed to download: {video['title']} | Error: {err}")
+
+                        # Create zip file
+                        zip_filename = f"channel_batch_{batch_idx + 1}.zip"
+                        zip_path = os.path.join(st.session_state.batch_zip_dir, zip_filename)
+                        with zipfile.ZipFile(zip_path, 'w') as zipf:
+                            for file in os.listdir(temp_dir):
+                                if file.endswith(".mp4"):
+                                    zipf.write(os.path.join(temp_dir, file), arcname=file)
+
+                        # Store zip path for download button
+                        st.session_state.batch_zips.append((batch_idx + 1, zip_path))
+                        st.success(f"✅ Batch {batch_idx + 1} downloaded and zipped successfully!")
+
+        # Display download buttons for all completed batches
+        if st.session_state.batch_zips:
+            st.markdown("### Completed Batches")
+            for batch_num, zip_path in st.session_state.batch_zips:
+                if os.path.exists(zip_path):
                     with open(zip_path, "rb") as zf:
-                        st.success(f"✅ Batch {batch_number} downloaded and zipped successfully!")
-                        st.download_button(f"📦 Download Batch {batch_number} ZIP", zf, file_name=zip_filename)
-
-                # Increment batch index
-                st.session_state.current_batch += 1
-        else:
-            st.write("All batches have been downloaded.")
+                        st.download_button(
+                            f"📦 Download Batch {batch_num} ZIP",
+                            zf,
+                            file_name=f"channel_batch_{batch_num}.zip"
+                        )
+                else:
+                    st.warning(f"Batch {batch_num} ZIP file is no longer available.")
